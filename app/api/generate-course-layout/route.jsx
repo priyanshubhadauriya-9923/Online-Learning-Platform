@@ -1,127 +1,176 @@
-import { db } from '@/config/db';
-import { coursesTable } from '@/config/schema';
-import { auth, currentUser } from '@clerk/nextjs/server';
-import {
-  GoogleGenAI,
-} from '@google/genai';
-import axios from 'axios';
-import { NextResponse } from 'next/server';
-import { v4 as uuidv4 } from 'uuid';
+// app/api/generate-course/route.js
 
-const PROMPT=`
-Genrate Learning Course depends on following details. In which Make sure to add Course Name, Description, Course Banner Image Prompt (Create a modern, flat-style 2D digital illustration representing user Topic. Include UI/UX elements such as mockup screens, text blocks, icons, buttons, and creative workspace tools. Add symbolic elements related to user Course, like sticky notes, design components, and visual aids. Use a vibrant color palette (blues, purples, oranges) with a clean, professional look. The illustration should feel creative, tech-savvy, and educational, ideal for visualizing concepts in user Course) for Course Banner in 3d format Chapter Name,, Topic under each chapters, Duration for each chapters etc, in JSON format only Schema:
+import { db } from "@/config/db";
+import { coursesTable } from "@/config/schema";
+import { auth, currentUser } from "@clerk/nextjs/server";
+import { GoogleGenAI } from "@google/genai";
+import axios from "axios";
+import { NextResponse } from "next/server";
+import { v4 as uuidv4 } from "uuid";
+
+// ------------------ PROMPT ------------------
+const PROMPT = `
+Generate a learning course based on the following details. 
+Make sure to add:
+- Course Name
+- Description
+- Category
+- Level
+- Include Video (boolean)
+- Number of Chapters
+- Course Banner Image Prompt
+- Chapters with Name, Duration, Topics
+Output in strict JSON format:
 {
-"course": {
-"name": "string", 
-"description": "string",
-"category": "string",
-"level": "string",
-"include Video": "boolean", 
-"noOfChapters": "number", 
-"bannerImagePrompt": "string", 
-"chapters": [
-{
-    "chapterName": "string",
-      "duration": "string",
-         "topics": [
-           "string"
-           ],
-        }
-      ]
-   }
+  "course": {
+    "name": "string",
+    "description": "string",
+    "category": "string",
+    "level": "string",
+    "includeVideo": "boolean",
+    "noOfChapters": "number",
+    "bannerImagePrompt": "string",
+    "chapters": [
+      {
+        "chapterName": "string",
+        "duration": "string",
+        "topics": ["string"]
+      }
+    ]
+  }
 }
-User Input:`
+User Input:
+`;
 
-export const ai = new GoogleGenAI(process.env.GEMINI_API_KEY);
+// ------------------ AI INIT ------------------
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
 
+// ------------------ HELPERS ------------------
+async function GenerateImage(imagePrompt) {
+  try {
+    const BASE_URL = "https://aigurulab.tech";
+
+    const result = await axios.post(
+      `${BASE_URL}/api/generate-image`,
+      {
+        width: 1024,
+        height: 1024,
+        input: imagePrompt,
+        model: "flux",
+        aspectRatio: "16:9",
+      },
+      {
+        headers: {
+          "x-api-key": process?.env?.AI_GURU_LAB_API,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("🔹 Image generated successfully");
+    return result.data.image;
+  } catch (error) {
+    console.error("❌ Image generation failed:", error.message);
+    return null;
+  }
+}
+
+function extractJSON(text) {
+  try {
+    if (!text) return null;
+
+    // Remove Markdown code blocks if present
+    let cleaned = text
+      .replace(/```json/i, "")
+      .replace(/```/g, "")
+      .trim();
+
+    // Find first JSON object in the text
+    const match = cleaned.match(/{[\s\S]*}/);
+    if (match) {
+      return JSON.parse(match[0]);
+    }
+    return null;
+  } catch (error) {
+    console.error("❌ JSON parse failed:", error.message);
+    return null;
+  }
+}
+
+// ------------------ API HANDLER ------------------
 export async function POST(req) {
-    const {courseId,...formData}=await req.json();
-    const user=await currentUser();
+  try {
+    // 🔹 Step 1: Auth
+    const user = await currentUser();
+    if (!user) {
+      return NextResponse.json(
+        { message: "Unauthorized" },
+        { status: 401 }
+      );
+    }
 
-    const { has } = await auth()
+    const { has } = await auth();
+    const hasPremiumAccess = has({ plan: "starter" });
 
-    const hasPremiumAccess = has({ plan: 'starter' })
+    // 🔹 Step 2: Parse request body
+    const { courseId, ...formData } = await req.json();
+    console.log("🔹 Incoming data:", formData);
 
+    // 🔹 Step 3: Check free plan course limit
+    if (!hasPremiumAccess) {
+      const existing = await db
+        .select()
+        .from(coursesTable)
+        .where(eq(coursesTable.userEmail, user?.primaryEmailAddress.emailAddress));
 
-   const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-  });
-  const config = {
-    responseMimeType: 'text/plain',
-  };
-  const model = 'gemini-2.0-flash';
-  const contents = [
-    {
-      role: 'user',
-      parts: [
+      if (existing?.length >= 1) {
+        return NextResponse.json({ resp: "limit exceed" }, { status: 403 });
+      }
+    }
+
+    // 🔹 Step 4: Call Gemini
+    const response = await ai.models.generateContent({
+      model: "gemini-2.0-flash",
+      config: { responseMimeType: "text/plain" },
+      contents: [
         {
-          text: PROMPT+JSON.stringify(formData),
+          role: "user",
+          parts: [{ text: PROMPT + JSON.stringify(formData) }],
         },
       ],
-    },
-  ];
+    });
 
-  //if user already created any course?
-  if(!hasPremiumAccess)
-  {
-    const result=await db.select().from(coursesTable)
-    .where(eq(coursesTable.userEmail,user?.primaryEmailAddress.emailAddress));
+    const rawText = response?.candidates?.[0]?.content?.parts?.[0]?.text;
+    console.log("🔹 Gemini raw output:", rawText?.slice(0, 200) + "...");
 
-    if(result?.length>=1)
-    {
-      return NextResponse.json({'resp':'limit exceed'})
+    const JSONResp = extractJSON(rawText);
+    if (!JSONResp) {
+      throw new Error("Gemini did not return valid JSON");
     }
+
+    // 🔹 Step 5: Generate Banner Image
+    const imagePrompt = JSONResp.course?.bannerImagePrompt || "Modern educational illustration";
+    const bannerImageUrl = await GenerateImage(imagePrompt);
+
+    // 🔹 Step 6: Save to DB
+    await db.insert(coursesTable).values({
+      ...formData,
+      courseJson: JSONResp,
+      userEmail: user?.primaryEmailAddress?.emailAddress,
+      cid: courseId || uuidv4(),
+      bannerImageUrl,
+    });
+
+    console.log("✅ Course saved successfully");
+
+    return NextResponse.json({ courseId });
+  } catch (error) {
+    console.error("❌ API ERROR in generate-course:", error);
+    return NextResponse.json(
+      { message: "Internal Server Error", error: error.message },
+      { status: 500 }
+    );
   }
-
-  const response = await ai.models.generateContent({
-    model,
-    config,
-    contents,
-  });
-
-  console.log(response.candidates[0].content.parts[0].text)
-  const RawResp=response?.candidates[0]?.content?.parts[0]?.text
-  const RawJson=RawResp.replace('```json','').replace('```','');
-  const JSONResp=JSON.parse(RawJson);
-   
-  const ImagePrompt=JSONResp.course?.bannerImagePrompt;
-
-
-  //generate image
-  const bannerImageUrl=await GenerateImage(ImagePrompt)
-  
-  //Save to Database
-  const result=await db.insert(coursesTable).values({
-    ...formData,
-    courseJson:JSONResp,
-    userEmail:user?.primaryEmailAddress?.emailAddress,
-    cid:courseId,
-    bannerImageUrl:bannerImageUrl
-  });
-
-  return NextResponse.json({courseId:courseId}); 
-
 }
-
-
-const GenerateImage=async(imagePrompt)=>{
-    const BASE_URL='https://aigurulab.tech';
-const result = await axios.post(BASE_URL+'/api/generate-image',
-        {
-            width: 1024,
-            height: 1024,
-            input: imagePrompt,
-            model: 'flux',//'flux'
-            aspectRatio:"16:9"//Applicable to Flux model only
-        },
-        {
-            headers: {
-                'x-api-key': process?.env?.AI_GURU_LAB_API, // Your API Key
-                'Content-Type': 'application/json', // Content Type
-            },
-        })
-        console.log(result.data.image) //Output Result: Base 64 Image
-        return result.data.image;
-}
-
-
