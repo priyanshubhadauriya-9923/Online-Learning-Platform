@@ -7,6 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import axios from "axios";
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
+import { eq } from "drizzle-orm";
 
 // ------------------ PROMPT ------------------
 const PROMPT = `
