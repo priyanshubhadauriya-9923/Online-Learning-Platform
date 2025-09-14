@@ -1,5 +1,4 @@
-// app/api/generate-course/route.js
-
+// app/api/generate-course-layout/route.jsx
 import { db } from "@/config/db";
 import { coursesTable } from "@/config/schema";
 import { auth, currentUser } from "@clerk/nextjs/server";
@@ -9,27 +8,23 @@ import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import { eq } from "drizzle-orm";
 
-// ------------------ PROMPT ------------------
+/**
+ * Debug: set DEBUG=true as a Vercel environment variable while troubleshooting.
+ * WARNING: turn DEBUG off in production after debugging to avoid leaking details.
+ */
+const DEBUG = process.env.DEBUG === "true";
+
 const PROMPT = `
-Generate a learning course based on the following details. 
-Make sure to add:
-- Course Name
-- Description
-- Category
-- Level
-- Include Video (boolean)
-- Number of Chapters
-- Course Banner Image Prompt
-- Chapters with Name, Duration, Topics
-Output in strict JSON format:
+Generate a learning course based on the following details.
+Return STRICT JSON only using this schema:
 {
   "course": {
     "name": "string",
     "description": "string",
     "category": "string",
     "level": "string",
-    "includeVideo": "boolean",
-    "noOfChapters": "number",
+    "includeVideo": true|false,
+    "noOfChapters": number,
     "bannerImagePrompt": "string",
     "chapters": [
       {
@@ -43,17 +38,54 @@ Output in strict JSON format:
 User Input:
 `;
 
-// ------------------ AI INIT ------------------
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
+/* -------------------- Helpers -------------------- */
 
-// ------------------ HELPERS ------------------
+function makeErrorResponse(step, message, extra = null, status = 500) {
+  const body = { success: false, step, message };
+  if (DEBUG && extra) body.details = extra;
+  console.error(`[${step}]`, message, extra ?? "");
+  return NextResponse.json(body, { status });
+}
+
+function safeJSONExtract(text) {
+  if (!text || typeof text !== "string") return null;
+
+  // strip common markdown code fences
+  let cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+
+  // Try to match the first top-level JSON object/array
+  const objMatch = cleaned.match(/({[\s\S]*})/);
+  if (objMatch) {
+    try {
+      return JSON.parse(objMatch[0]);
+    } catch (err) {
+      // fall through to more permissive attempts
+    }
+  }
+
+  // Attempt to find last '{' to last '}' region (avoid greedy mismatches)
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    const candidate = cleaned.slice(start, end + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch (err) {
+      // give up
+    }
+  }
+
+  return null;
+}
+
 async function GenerateImage(imagePrompt) {
-  try {
-    const BASE_URL = "https://aigurulab.tech";
+  if (!process.env.AI_GURU_LAB_API) {
+    throw new Error("Missing AI_GURU_LAB_API env variable");
+  }
 
-    const result = await axios.post(
+  const BASE_URL = "https://aigurulab.tech";
+  try {
+    const resp = await axios.post(
       `${BASE_URL}/api/generate-image`,
       {
         width: 1024,
@@ -64,114 +96,143 @@ async function GenerateImage(imagePrompt) {
       },
       {
         headers: {
-          "x-api-key": process?.env?.AI_GURU_LAB_API,
+          "x-api-key": process.env.AI_GURU_LAB_API,
           "Content-Type": "application/json",
         },
+        timeout: 60_000, // 60s timeout for the image provider
       }
     );
 
-    console.log("🔹 Image generated successfully");
-    return result.data.image;
-  } catch (error) {
-    console.error("❌ Image generation failed:", error.message);
-    return null;
+    // provider returns base64 image or url in resp.data.image
+    return resp.data?.image ?? null;
+  } catch (err) {
+    // Wrap the error so calling code can choose to continue or fail
+    console.error("GenerateImage error:", err?.message ?? err);
+    // include minimal info for debugging
+    throw new Error(err?.response?.data?.message ?? err?.message ?? "Image generation failed");
   }
 }
 
-function extractJSON(text) {
-  try {
-    if (!text) return null;
+/* -------------------- API Handler -------------------- */
 
-    // Remove Markdown code blocks if present
-    let cleaned = text
-      .replace(/```json/i, "")
-      .replace(/```/g, "")
-      .trim();
-
-    // Find first JSON object in the text
-    const match = cleaned.match(/{[\s\S]*}/);
-    if (match) {
-      return JSON.parse(match[0]);
-    }
-    return null;
-  } catch (error) {
-    console.error("❌ JSON parse failed:", error.message);
-    return null;
-  }
-}
-
-// ------------------ API HANDLER ------------------
 export async function POST(req) {
   try {
-    // 🔹 Step 1: Auth
+    // 1) Quick env check
+    const missingEnv = [];
+    if (!process.env.GEMINI_API_KEY) missingEnv.push("GEMINI_API_KEY");
+    if (!process.env.AI_GURU_LAB_API) missingEnv.push("AI_GURU_LAB_API");
+    if (missingEnv.length) {
+      return makeErrorResponse("env", `Missing env vars: ${missingEnv.join(", ")}`, null, 500);
+    }
+
+    // 2) Auth
     const user = await currentUser();
-    if (!user) {
-      return NextResponse.json(
-        { message: "Unauthorized" },
-        { status: 401 }
-      );
+    if (!user) return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
+
+    const userEmail =
+      user?.primaryEmailAddress?.emailAddress ||
+      user?.emailAddresses?.[0]?.emailAddress ||
+      user?.email;
+
+    if (!userEmail) {
+      return makeErrorResponse("auth", "Logged-in user has no email address available", null, 400);
     }
 
     const { has } = await auth();
     const hasPremiumAccess = has({ plan: "starter" });
 
-    // 🔹 Step 2: Parse request body
-    const { courseId, ...formData } = await req.json();
-    console.log("🔹 Incoming data:", formData);
+    // 3) Parse incoming body
+    let body;
+    try {
+      body = await req.json();
+    } catch (err) {
+      return makeErrorResponse("parse_request", "Invalid JSON in request body", err?.message, 400);
+    }
 
-    // 🔹 Step 3: Check free plan course limit
+    const { courseId: incomingCid, ...formData } = body || {};
+    console.log("Incoming formData preview:", Object.keys(formData));
+
+    // 4) Free-plan limit check
     if (!hasPremiumAccess) {
-      const existing = await db
-        .select()
-        .from(coursesTable)
-        .where(eq(coursesTable.userEmail, user?.primaryEmailAddress.emailAddress));
-
-      if (existing?.length >= 1) {
-        return NextResponse.json({ resp: "limit exceed" }, { status: 403 });
+      try {
+        const existing = await db.select().from(coursesTable).where(eq(coursesTable.userEmail, userEmail));
+        if (existing?.length >= 1) {
+          return NextResponse.json({ success: false, resp: "limit exceed" }, { status: 403 });
+        }
+      } catch (err) {
+        return makeErrorResponse("db_check", "Failed checking existing courses", err?.message);
       }
     }
 
-    // 🔹 Step 4: Call Gemini
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      config: { responseMimeType: "text/plain" },
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: PROMPT + JSON.stringify(formData) }],
-        },
-      ],
-    });
-
-    const rawText = response?.candidates?.[0]?.content?.parts?.[0]?.text;
-    console.log("🔹 Gemini raw output:", rawText?.slice(0, 200) + "...");
-
-    const JSONResp = extractJSON(rawText);
-    if (!JSONResp) {
-      throw new Error("Gemini did not return valid JSON");
+    // 5) Call Gemini
+    let ai;
+    try {
+      ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    } catch (err) {
+      return makeErrorResponse("ai_init", "Failed to initialize AI client", err?.message);
     }
 
-    // 🔹 Step 5: Generate Banner Image
-    const imagePrompt = JSONResp.course?.bannerImagePrompt || "Modern educational illustration";
-    const bannerImageUrl = await GenerateImage(imagePrompt);
+    let aiResponse;
+    try {
+      aiResponse = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        config: { responseMimeType: "text/plain" },
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: PROMPT + JSON.stringify(formData) }],
+          },
+        ],
+      });
+    } catch (err) {
+      return makeErrorResponse("ai_call", "Gemini API call failed", err?.message ?? err, 502);
+    }
 
-    // 🔹 Step 6: Save to DB
-    await db.insert(coursesTable).values({
-      ...formData,
-      courseJson: JSONResp,
-      userEmail: user?.primaryEmailAddress?.emailAddress,
-      cid: courseId || uuidv4(),
-      bannerImageUrl,
-    });
+    // 6) Extract JSON from AI response
+    const rawText = aiResponse?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    console.log("AI raw text snippet:", rawText?.slice(0, 300));
+    const parsed = safeJSONExtract(rawText);
+    if (!parsed) {
+      // send back rawText snippet if DEBUG
+      return makeErrorResponse(
+        "ai_parse",
+        "Could not extract valid JSON from AI response",
+        DEBUG ? { rawText: rawText?.slice(0, 200) } : null,
+        502
+      );
+    }
 
-    console.log("✅ Course saved successfully");
+    // 7) Image generation (non-fatal; we'll continue if it fails)
+    let bannerImageUrl = null;
+    try {
+      const imagePrompt = parsed?.course?.bannerImagePrompt || "Modern educational illustration";
+      bannerImageUrl = await GenerateImage(imagePrompt);
+    } catch (err) {
+      // log but don't fail entire request - save with null banner and return a warning
+      console.warn("Warning: banner image generation failed:", err?.message ?? err);
+      // keep bannerImageUrl as null and record warning for response
+    }
 
-    return NextResponse.json({ courseId });
-  } catch (error) {
-    console.error("❌ API ERROR in generate-course:", error);
-    return NextResponse.json(
-      { message: "Internal Server Error", error: error.message },
-      { status: 500 }
-    );
+    // 8) Save to DB (stringify course JSON to avoid column type issues)
+    const cid = incomingCid || uuidv4();
+    try {
+      await db.insert(coursesTable).values({
+        ...formData,
+        courseJson: JSON.stringify(parsed),
+        userEmail,
+        cid,
+        bannerImageUrl,
+      });
+    } catch (err) {
+      return makeErrorResponse("db_insert", "Failed to insert course into DB", err?.message ?? err);
+    }
+
+    // 9) Success
+    const respBody = { success: true, courseId: cid, bannerImageUrl };
+    if (!bannerImageUrl) respBody.warning = "Banner image generation failed or returned null";
+    return NextResponse.json(respBody, { status: 201 });
+  } catch (err) {
+    // Catch-all error - include stack only when DEBUG
+    return makeErrorResponse("unknown", "Unhandled server error", DEBUG ? err?.stack ?? err : null, 500);
   }
 }
